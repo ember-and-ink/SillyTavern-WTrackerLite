@@ -92,28 +92,33 @@ function formatTrackerForContext(data: any): string {
   return lines.join('\n');
 }
 
-function includeWTrackerLiteMessages(messages: any[], settings: ExtensionSettings): any[] {
-  const copyMessages = structuredClone(messages);
-  if (settings.includeLastXWTrackerLiteMessages > 0) {
-    for (let i = 0; i < settings.includeLastXWTrackerLiteMessages; i++) {
-      let foundIndex = -1;
-      for (let j = copyMessages.length - 2; j >= 0; j--) {
-        // -2 to skip current message
-        const message = copyMessages[j];
-        if (!message.wTrackerFound && message.extra?.[EXTENSION_KEY]?.[CHAT_MESSAGE_SCHEMA_VALUE_KEY]) {
-          message.wTrackerFound = true;
-          foundIndex = j;
-          break;
-        }
-      }
-      if (foundIndex !== -1) {
-        const trackerValue = copyMessages[foundIndex].extra[EXTENSION_KEY][CHAT_MESSAGE_SCHEMA_VALUE_KEY];
-        const content = formatTrackerForContext(trackerValue);
-        copyMessages.splice(foundIndex + 1, 0, { role: 'user', content, is_user: true, mes: content, is_system: false });
-      }
+/**
+ * Splices tracker context messages into `messages` in place.
+ *
+ * This must never copy the message objects. Other extensions (e.g. qvink memory) mark
+ * messages with Symbol-keyed flags such as `extra[Symbol.for('ignore')]`, and both
+ * structuredClone and JSON round-trips silently drop Symbol keys — which would wipe
+ * their work and force the whole prompt to be re-sent every turn, destroying prompt
+ * caching. Only the array itself is mutated; the message objects are read, never written.
+ */
+function includeWTrackerLiteMessages(messages: any[], settings: ExtensionSettings): void {
+  if (settings.includeLastXWTrackerLiteMessages <= 0) return;
+
+  // Collect target indexes first, walking backwards and skipping the current message (-2).
+  const foundIndexes: number[] = [];
+  for (let j = messages.length - 2; j >= 0; j--) {
+    if (foundIndexes.length >= settings.includeLastXWTrackerLiteMessages) break;
+    if (messages[j]?.extra?.[EXTENSION_KEY]?.[CHAT_MESSAGE_SCHEMA_VALUE_KEY]) {
+      foundIndexes.push(j);
     }
   }
-  return copyMessages;
+
+  // Already in descending order, so each splice leaves the remaining indexes valid.
+  for (const foundIndex of foundIndexes) {
+    const trackerValue = messages[foundIndex].extra[EXTENSION_KEY][CHAT_MESSAGE_SCHEMA_VALUE_KEY];
+    const content = formatTrackerForContext(trackerValue);
+    messages.splice(foundIndex + 1, 0, { role: 'user', content, is_user: true, mes: content, is_system: false });
+  }
 }
 
 async function deleteTracker(messageId: number) {
@@ -230,11 +235,12 @@ async function generateTracker(id: number) {
     const startIndex = settings.includeLastXMessages > 0 ? Math.max(0, id - settings.includeLastXMessages) : 0;
     const chatSlice = context.chat.slice(startIndex, id + 1);
 
-    // Inject previous tracker context messages into the slice
-    const augmented = includeWTrackerLiteMessages(chatSlice, settings);
+    // Inject previous tracker context messages into the slice (slice() already gave us
+    // our own array, so mutating it does not touch context.chat)
+    includeWTrackerLiteMessages(chatSlice, settings);
 
     // Convert to {role, content}[] for sendRequest
-    const messages: { role: string; content: string }[] = augmented.map((msg: any) => ({
+    const messages: { role: string; content: string }[] = chatSlice.map((msg: any) => ({
       role: msg.is_user || msg.role === 'user' ? 'user' : 'assistant',
       content: msg.content || msg.mes || '',
     }));
@@ -383,10 +389,10 @@ async function initializeGlobalUI() {
   });
 
   // Register the global generation interceptor
+  // Mutate the array ST handed us in place. Do not rebuild it from a copy — see
+  // includeWTrackerLiteMessages for why (Symbol-keyed flags from other extensions).
   (globalThis as any).wtrackerliteGenerateInterceptor = (chat: any[]) => {
-    const newChat = includeWTrackerLiteMessages(chat, settingsManager.getSettings());
-    chat.length = 0;
-    chat.push(...newChat);
+    includeWTrackerLiteMessages(chat, settingsManager.getSettings());
   };
 }
 
